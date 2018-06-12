@@ -3,7 +3,7 @@ import itertools
 import logging
 import os
 import re
-import sys
+from subprocess import call
 
 import click
 import pathlib
@@ -38,28 +38,10 @@ def get_extension(pandoc_fmt):
 
 def find_storage_directories():
     home_dir = pathlib.Path(os.environ['HOME'])
-    candidates = []
-    if sys.platform == "linux" or sys.platform == "linux2":
-        firefox_dir = home_dir/".mozilla"/"firefox"
-        if firefox_dir.exists():
-            candidates.append(firefox_dir.iterdir())
-        zotero_dir = home_dir/".zotero"
-        if zotero_dir.exists():
-            candidates.append(zotero_dir.iterdir())
-        zotero5_dir = home_dir/"Zotero/storage"
-        if zotero5_dir.exists():
-            yield ('default', zotero5_dir)
-    elif sys.platform == "win32":
-        win_support_dir = home_dir/"AppData"/"Roaming"
-        zotero_win_dir = win_support_dir/"Zotero"/"Zotero"/"Profiles"
-        if zotero_win_dir.exists():
-            candidates.append(zotero_win_dir.iterdir())
-    elif sys.platform == "darwin":
-        osx_support_dir = home_dir/"Library"/"Application Support"
-        zotero_osx_dir = osx_support_dir/"Zotero"/"Profiles"
-        if zotero_osx_dir.exists():
-            candidates.append(zotero_osx_dir.iterdir())
-    candidate_iter = itertools.chain.from_iterable(candidates)
+    firefox_dir = home_dir/".mozilla"/"firefox"
+    zotero_dir = home_dir/".zotero"
+    candidate_iter = itertools.chain(firefox_dir.iterdir(),
+                                     zotero_dir.iterdir())
     for fpath in candidate_iter:
         if not fpath.is_dir():
             continue
@@ -77,12 +59,10 @@ def find_storage_directories():
 @click.pass_context
 def cli(ctx, verbose, api_key, library_id):
     """ Command-line access to your Zotero library. """
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING)
     if ctx.invoked_subcommand != 'configure':
         try:
-            ctx.obj = ZoteroBackend(
-                api_key, library_id, 'user',
-                autosync=(ctx.invoked_subcommand != 'sync'))
+            ctx.obj = ZoteroBackend(api_key, library_id, 'user')
         except ValueError as e:
             ctx.fail(e.args[0])
 
@@ -146,7 +126,7 @@ def configure():
                 config['webdav_pass'] = click.prompt(
                     "Please enter the WebDAV password")
             try:
-                test_resp = requests.options(
+                test_resp = requests.get(
                     config['webdav_path'],
                     auth=(config['webdav_user'],
                           config['webdav_pass']))
@@ -154,7 +134,7 @@ def configure():
                 click.echo("Invalid WebDAV URL, could not reach server.")
                 config['webdav_path'] = None
                 continue
-            if test_resp.status_code == 200:
+            if test_resp.status_code == 501:
                 break
             elif test_resp.status_code == 404:
                 click.echo("Invalid WebDAV path, does not exist.")
@@ -164,8 +144,6 @@ def configure():
                 config['webdav_user'] = None
             else:
                 click.echo("Unknown error, please check your settings.")
-                click.echo("Server response code was: {}"
-                           .format(test_resp.status_code))
                 config['webdav_path'] = None
                 config['webdav_user'] = None
     config['sync_method'] = sync_method
@@ -185,7 +163,6 @@ def configure():
 @click.pass_context
 def sync(ctx):
     """ Synchronize the local search index. """
-    click.echo("Synchronizing")
     num_items = ctx.obj.synchronize()
     click.echo("Updated {} items.".format(num_items))
 
@@ -237,7 +214,7 @@ def read(ctx, item_id, with_note):
         if existing_notes:
             edit_existing = click.confirm("Edit existing note?")
             if edit_existing:
-                note = pick_note(ctx, ctx.obj, item_id)
+                note = pick_note(ctx.obj, item_id)
             else:
                 note = None
         else:
@@ -251,6 +228,30 @@ def read(ctx, item_id, with_note):
             note['data']['note']['text'] = note_body
             ctx.obj.save_note(note)
 
+
+@cli.command()
+@click.argument("item-id", required=True)
+@click.pass_context
+def pharos(ctx, item_id):
+    """ Print an item attachment. """
+    try:
+        item_id = pick_item(ctx.obj, item_id)
+    except ValueError as e:
+        ctx.fail(e.args[0])
+    print_att = None
+    attachments = ctx.obj.attachments(item_id)
+    if not attachments:
+        ctx.fail("Could not find an attachment for printing.")
+    elif len(attachments) > 1:
+        click.echo("Multiple attachments available.")
+        print_att = select([(att, att['data']['title'])
+                           for att in attachments])
+    else:
+        print_att = attachments[0]
+
+    att_path = ctx.obj.get_attachment_path(print_att)
+    click.echo("Printing '{}'.".format(att_path))
+    call(['/bin/zsh', '-i', '-c', "pharos \"{}\"".format(att_path)])
 
 @cli.command("add-note")
 @click.argument("item-id", required=True)
@@ -281,7 +282,7 @@ def edit_note(ctx, item_id, note_num):
         item_id = pick_item(ctx.obj, item_id)
     except ValueError as e:
         ctx.fail(e.args[0])
-    note = pick_note(ctx, ctx.obj, item_id, note_num)
+    note = pick_note(ctx.obj, item_id, note_num)
     updated_text = click.edit(note['data']['note']['text'],
                               extension=get_extension(ctx.obj.note_format))
     if updated_text:
@@ -300,14 +301,14 @@ def export_note(ctx, item_id, note_num, output):
         item_id = pick_item(ctx.obj, item_id)
     except ValueError as e:
         ctx.fail(e.args[0])
-    note = pick_note(ctx, ctx.obj, item_id, note_num)
+    note = pick_note(ctx.obj, item_id, note_num)
     output.write(note['data']['note']['text'].encode('utf8'))
 
 
-def pick_note(ctx, zot, item_id, note_num=None):
+def pick_note(zot, item_id, note_num=None):
     notes = tuple(zot.notes(item_id))
     if not notes:
-        ctx.fail("The item does not have any notes.")
+        zot.fail("The item does not have any notes.")
     if note_num is None:
         if len(notes) > 1:
             note = select(
@@ -339,7 +340,6 @@ def pick_item(zot, item_id):
             return items[0].key
         else:
             raise ValueError("Could not find any items for the query.")
-    return item_id
 
 
 def select(choices, prompt="Please choose one", default=0, required=True):

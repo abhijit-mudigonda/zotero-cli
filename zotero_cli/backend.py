@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import sys
 import tempfile
 import time
 import urllib
@@ -33,9 +32,7 @@ from rauth import OAuth1Service
 from zotero_cli.common import APP_NAME, Item, load_config
 from zotero_cli.index import SearchIndex
 
-from io import open
 
-IS_PY3 = sys.version_info > (2,)
 TEMP_DIR = Path(tempfile.mkdtemp(prefix='zotcli'))
 DATA_PAT = re.compile(
     r'<div class="zotcli-note">.*<p .*title="([A-Za-z0-9+/=\n ]+)">.*</div>',
@@ -44,9 +41,9 @@ CITEKEY_PAT = re.compile(r'^bibtex: (.*)$', flags=re.MULTILINE)
 DATA_TMPL = """
     <div class="zotcli-note">
         <p xmlns="http://www.w3.org/1999/xhtml"
-           id="zotcli-data" style="color: #cccccc;"
-           xml:base="http://www.w3.org/1999/xhtml"
-           title="{data}">
+        id="zotcli-data" style="color: #cccccc;"
+        xml:base="http://www.w3.org/1999/xhtml"
+        title="{data}">
         (hidden zotcli data)
         </p>
     </div>
@@ -69,7 +66,7 @@ def encode_blob(data):
     blob_data = json.dumps(data).encode('utf8')
     for codec in ('zlib', 'base64'):
         blob_data = codecs.encode(blob_data, codec)
-    return blob_data.replace(b'\n', b'')
+    return blob_data
 
 
 def decode_blob(blob_data):
@@ -80,8 +77,6 @@ def decode_blob(blob_data):
     :type blob_data:    bytes
     :returns:           The original data as a dictionary
     """
-    if IS_PY3:
-        blob_data = blob_data.encode('utf8')
     for codec in ('base64', 'zlib'):
         blob_data = codecs.decode(blob_data, codec)
     return json.loads(blob_data.decode('utf8'))
@@ -125,8 +120,7 @@ class ZoteroBackend(object):
         access = urlparse.parse_qs(token_resp.text)
         return access['oauth_token'][0], access['userID'][0]
 
-    def __init__(self, api_key=None, library_id=None, library_type='user',
-                 autosync=False):
+    def __init__(self, api_key=None, library_id=None, library_type='user'):
         """ Service class for communicating with the Zotero API.
 
         This is mainly a thin wrapper around :py:class:`pyzotero.zotero.Zotero`
@@ -156,11 +150,10 @@ class ZoteroBackend(object):
         self._index = SearchIndex(idx_path)
         sync_interval = self.config.get('zotcli.sync_interval', 300)
         since_last_sync = int(time.time()) - self._index.last_modified
-        if autosync and since_last_sync >= int(sync_interval):
-            click.echo("{} seconds since last sync, synchronizing."
-                       .format(since_last_sync))
-            num_updated = self.synchronize()
-            click.echo("Updated {} items".format(num_updated))
+        if since_last_sync >= int(sync_interval):
+            self._logger.info("{} seconds since last sync, synchronizing."
+                              .format(since_last_sync))
+            self.synchronize()
 
     def synchronize(self):
         """ Update the local index to the latest library version. """
@@ -191,30 +184,22 @@ class ZoteroBackend(object):
         :type recursive: bool
         :returns:       Generator that yields items
         """
-        if limit is None:
-            limit = 100
         query_args = {'since': since}
         if query:
             query_args['q'] = query
         if limit:
             query_args['limit'] = limit
         query_fn = self._zot.items if recursive else self._zot.top
-        # NOTE: Normally we'd use the makeiter method of Zotero, but it seems
-        #       to be broken at the moment, thus we call .follow ourselves
-        items = query_fn(**query_args)
-        last_url = self._zot.links.get('last')
-        if last_url:
-            while self._zot.links['self'] != last_url:
-                items.extend(self._zot.follow())
-        for it in items:
-            matches = CITEKEY_PAT.finditer(it['data'].get('extra', ''))
-            citekey = next((m.group(1) for m in matches), None)
-            yield Item(key=it['data']['key'],
-                       creator=it['meta'].get('creatorSummary'),
-                       title=it['data'].get('title', "Untitled"),
-                       abstract=it['data'].get('abstractNote'),
-                       date=it['data'].get('date'),
-                       citekey=citekey)
+        items = self._zot.makeiter(query_fn(**query_args))
+        for chunk in items:
+            for it in chunk:
+                matches = CITEKEY_PAT.finditer(it['data'].get('extra', ''))
+                citekey = next((m.group(1) for m in matches), None)
+                yield Item(key=it['data']['key'],
+                           creator=it['meta'].get('creatorSummary'),
+                           title=it['data'].get('title', "Untitled"),
+                           date=it['data'].get('date'),
+                           citekey=citekey)
 
     def notes(self, item_id):
         """ Get a list of all notes for a given item.
@@ -286,10 +271,6 @@ class ZoteroBackend(object):
         data = None
         note_html = note_data['data']['note']
         note_version = note_data['version']
-        if "title=\"b'" in note_html:
-            # Fix for badly formatted notes from an earlier version (see #26)
-            note_html = re.sub(r'title="b\'(.*?)\'"', r'title="\1"', note_html)
-            note_html = note_html.replace("\\n", "")
         blobs = DATA_PAT.findall(note_html)
         # Previously edited with zotcli
         if blobs:
@@ -299,7 +280,7 @@ class ZoteroBackend(object):
             note_html = DATA_PAT.sub("", note_html)
         # Not previously edited with zotcli or updated from the Zotero UI
         if not data or data['version'] < note_version:
-            if data and data['version'] < note_version:
+            if data['version'] < note_version:
                 self._logger.info("Note changed on server, reloading markup.")
             note_format = data['format'] if data else self.note_format
             data = {
@@ -316,8 +297,7 @@ class ZoteroBackend(object):
         :param note_data:   dict with text, format and version of the note
         :returns:           Note as HTML
         """
-        extra_data = DATA_TMPL.format(
-            data=encode_blob(note_data).decode('utf8'))
+        extra_data = DATA_TMPL.format(data=encode_blob(note_data))
         html = pypandoc.convert(note_data['text'], 'html',
                                 format=note_data['format'])
         return html + extra_data
@@ -337,8 +317,8 @@ class ZoteroBackend(object):
             self._zot.create_items([note], item_id)
         except Exception as e:
             self._logger.error(e)
-            with open("note_backup.txt", "w", encoding='utf-8') as fp:
-                fp.write(note_data['text'])
+            with open("note_backup.txt", "w") as fp:
+                fp.write(raw_data['text'].encode('utf-8'))
             self._logger.warn(
                 "Could not upload note to Zotero. You can find the note "
                 "markup in 'note_backup.txt' in the current directory")
@@ -355,8 +335,8 @@ class ZoteroBackend(object):
             self._zot.update_item(note)
         except Exception as e:
             self._logger.error(e)
-            with open("note_backup.txt", "w", encoding='utf-8') as fp:
-                fp.write(raw_data['text'])
+            with open("note_backup.txt", "w") as fp:
+                fp.write(raw_data['text'].encode('utf-8'))
             self._logger.warn(
                 "Could not upload note to Zotero. You can find the note "
                 "markup in 'note_backup.txt' in the current directory")
